@@ -78,6 +78,7 @@ nlohmann::json CloudClient::chatCompletionStream(
                             auto& u = j["usage"];
                             usage["prompt_tokens"] = u.value("prompt_tokens", 0);
                             usage["completion_tokens"] = u.value("completion_tokens", 0);
+                            usage["cache_tokens"] = u.value("prompt_cache_hit_tokens", 0);
                         }
                     } catch (...) {}
                 }

@@ -65,8 +65,9 @@ static bool hasEscalateKeywords(const nlohmann::json& request,
 static double calculateCost(const std::string& backend,
                              int64_t inTokens, int64_t outTokens, int64_t cacheTokens) {
     if (backend == "ollama") return 0.0;
-    // DeepSeek pricing
-    return (inTokens / 1000.0) * COST_DEEPSEEK_INPUT +
+    // DeepSeek pricing: cached tokens are billed at cache rate instead of input rate
+    int64_t uncachedInput = inTokens - cacheTokens;
+    return (uncachedInput / 1000.0) * COST_DEEPSEEK_INPUT +
            (outTokens / 1000.0) * COST_DEEPSEEK_OUTPUT +
            (cacheTokens / 1000.0) * COST_DEEPSEEK_CACHE;
 }
