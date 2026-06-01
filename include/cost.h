@@ -62,10 +62,11 @@ private:
     UsageEntry parseLine(const std::string& line) const;
 };
 
-// Cost rates per 1K tokens (USD)
-constexpr double COST_DEEPSEEK_INPUT  = 0.00027;   // $0.27/M tok
-constexpr double COST_DEEPSEEK_OUTPUT = 0.00110;   // $1.10/M tok
-constexpr double COST_DEEPSEEK_CACHE  = 0.00007;   // $0.07/M tok cached
+// Cost rates per 1K tokens (USD) — DeepSeek V4 Flash (Apr 2026)
+// https://api-docs.deepseek.com/quick_start/pricing
+constexpr double COST_DEEPSEEK_INPUT  = 0.00007;   // $0.07/M tok input
+constexpr double COST_DEEPSEEK_OUTPUT = 0.00028;   // $0.28/M tok output
+constexpr double COST_DEEPSEEK_CACHE  = 0.000035;  // $0.035/M tok cached (50% of input)
 constexpr double COST_OLLAMA          = 0.0;       // Free
 
 #endif // LLM_COST_ROUTER_COST_H
