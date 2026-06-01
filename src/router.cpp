@@ -141,7 +141,9 @@ resolve_model:
         d.model = m_config.ollama.model;
         d.provider = "ollama";
     } else {
-        d.model = request.value("model", m_config.cloud.model);
+        // Use the configured cloud model, not the raw request model
+        // (Hermes sends "cost-router/deepseek-v4-flash" which DeepSeek doesn't know)
+        d.model = m_config.cloud.model;
         // Strip -cloud suffix if present
         if (d.model.size() > 6 && d.model.substr(d.model.size() - 6) == "-cloud") {
             d.model = d.model.substr(0, d.model.size() - 6);
