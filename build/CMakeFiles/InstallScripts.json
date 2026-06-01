@@ -1,7 +1,0 @@
-{
-	"InstallScripts" : 
-	[
-		"/home/sfarrant/Projects/llm-cost-router/build/cmake_install.cmake"
-	],
-	"Parallel" : false
-}
