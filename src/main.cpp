@@ -16,7 +16,7 @@ static void signalHandler(int sig) {
     static bool once = false;
     if (once) {
         std::cerr << "\n[main] Forced exit.\n";
-        std::_Exit(1);
+        std::_Exit(0);
     }
     once = true;
 

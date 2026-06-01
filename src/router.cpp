@@ -83,6 +83,16 @@ RouteDecision Router::decide(const nlohmann::json& request) {
     RouteDecision d;
     const auto& rc = m_config.router;
 
+    // 0. If the requested model matches the Ollama backend model, always route to Ollama
+    if (request.contains("model") && request["model"].is_string()) {
+        std::string reqModel = request["model"];
+        if (reqModel == m_config.ollama.model) {
+            d.backend = "ollama";
+            d.reason = "model matches ollama backend: " + reqModel;
+            goto resolve_model;
+        }
+    }
+
     // 1. Force override from header (stored in _meta.force_backend)
     if (request.contains("_meta") && request["_meta"].is_object() &&
         request["_meta"].contains("force_backend")) {
