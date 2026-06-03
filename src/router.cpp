@@ -88,6 +88,7 @@ static nlohmann::json stripMeta(const nlohmann::json& req) {
 RouteDecision Router::decide(const nlohmann::json& request) {
     RouteDecision d;
     const auto& rc = m_config.router;
+    int estTokens = estimateTokenCount(request);
 
     // 0. If the requested model matches the Ollama backend model, always route to Ollama
     if (request.contains("model") && request["model"].is_string()) {
@@ -127,15 +128,14 @@ RouteDecision Router::decide(const nlohmann::json& request) {
         }
     }
 
-    // 3. Token threshold
-    {
-        int estTokens = estimateTokenCount(request);
-        if (estTokens < rc.tokenThreshold) {
-            d.backend = rc.defaultBackend;
-            d.reason = "estimated tokens (" + std::to_string(estTokens) +
-                       ") < threshold (" + std::to_string(rc.tokenThreshold) + ")";
-            goto resolve_model;
-        }
+    // 3. Token estimation — used by multiple rules below
+
+    // 3a. Small requests → default backend (ollama, free)
+    if (estTokens < rc.tokenThreshold) {
+        d.backend = rc.defaultBackend;
+        d.reason = "estimated tokens (" + std::to_string(estTokens) +
+                   ") < threshold (" + std::to_string(rc.tokenThreshold) + ")";
+        goto resolve_model;
     }
 
     // 4. Keyword escalation
@@ -145,7 +145,16 @@ RouteDecision Router::decide(const nlohmann::json& request) {
         goto resolve_model;
     }
 
-    // 5. Fallback to default
+    // 5. Large prompts → cloud (Hermes system prompts are 50K-70K tokens)
+    //    Ollama can't handle them, so route directly to paid backend
+    if (estTokens > 5000) {
+        d.backend = "cloud";
+        d.reason = "estimated tokens (" + std::to_string(estTokens) +
+                   ") > 5000 — routing to cloud";
+        goto resolve_model;
+    }
+
+    // 6. Fallback to default
     d.backend = rc.defaultBackend;
     d.reason = "default backend (fallback)";
 
