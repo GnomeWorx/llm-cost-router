@@ -39,6 +39,7 @@ private:
     void handleAdminSummary(const httplib::Request& req, httplib::Response& res);
     void handleAdminConfigGet(const httplib::Request& req, httplib::Response& res);
     void handleAdminConfigPost(const httplib::Request& req, httplib::Response& res);
+    void handleAdminRefreshUsage(const httplib::Request& req, httplib::Response& res);
 
     // ── Streaming helpers ──
     void handleStreamingChat(const nlohmann::json& body,

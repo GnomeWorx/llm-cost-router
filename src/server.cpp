@@ -125,6 +125,11 @@ Server::Server(const AppConfig& config)
         [this](const httplib::Request& req, httplib::Response& res) {
             handleAdminConfigPost(req, res);
         });
+
+    m_http.Get("/admin/refresh-usage",
+        [this](const httplib::Request& req, httplib::Response& res) {
+            handleAdminRefreshUsage(req, res);
+        });
 }
 
 Server::~Server() {
@@ -149,8 +154,8 @@ void Server::start() {
               << "  ║──────────────────────────────────────────────────────║\n"
               << "  ║  Port:      " << std::left << std::setw(38) << m_config.server.port << "║\n"
               << "  ║  Default:   " << std::setw(38) << m_config.router.defaultBackend << "║\n"
-              << "  ║  Budget:    $" << std::fixed << std::setprecision(2)
-              << std::setw(37) << m_config.router.dailyBudgetUsd << "║\n"
+              << "  ║  Monthly:  $" << std::fixed << std::setprecision(2)
+              << std::setw(37) << m_config.router.monthlyBudgetUsd << "║\n"
               << "  ║  Log:       " << std::setw(38) << m_config.server.logPath << "║\n"
               << "  ╚══════════════════════════════════════════════════════╝\n"
               << "\n"
@@ -161,6 +166,7 @@ void Server::start() {
               << "    GET  /admin/summary         Daily cost summary\n"
               << "    GET  /admin/config          Current configuration\n"
               << "    POST /admin/config          Update configuration\n"
+              << "    GET  /admin/refresh-usage   Refresh usage data\n"
               << "\n";
 
     m_running = true;
@@ -176,12 +182,18 @@ void Server::stop() {
 // 429 helper
 // =============================================================================
 void Server::respondOverBudget(httplib::Response& res) {
+    double monthly = m_config.router.monthlyBudgetUsd;
+    auto days = CostTracker::daysInMonth();
+    auto today = CostTracker::dayOfMonth();
+    double daily = monthly / days;
     json body = {
         {"error", json{
-            {"message", "Daily budget of $" +
-                        std::to_string(m_config.router.dailyBudgetUsd) +
-                        " exceeded. Try again tomorrow or increase the cap via "
-                        "POST /admin/config."},
+            {"message", "Monthly budget ($" +
+                        std::to_string(monthly) +
+                        "/mo, ~$" + std::to_string(daily).substr(0, 5) +
+                        "/day) pro-rata limit reached on day " +
+                        std::to_string(today) + "/" + std::to_string(days) +
+                        ". Increase cap via POST /admin/config."},
             {"type", "insufficient_quota"},
             {"code", 429}
         }}
@@ -219,7 +231,7 @@ void Server::handleChatCompletion(const httplib::Request& req, httplib::Response
     }
 
     // 2. Budget check --------------------------------------------------------
-    if (m_config.costTracking && m_cost.isOverBudget(m_config.router.dailyBudgetUsd)) {
+    if (m_config.costTracking && m_cost.isOverMonthlyBudget(m_config.router.monthlyBudgetUsd)) {
         respondOverBudget(res);
         return;
     }
@@ -243,9 +255,9 @@ void Server::handleChatCompletion(const httplib::Request& req, httplib::Response
     if (streaming) {
         handleStreamingChat(body, decision, res);
     } else {
-        // ═══════════════════════════════════════════════════════════════════════
+        // =====================================================================
         //  Non-streaming path
-        // ═══════════════════════════════════════════════════════════════════════
+        // =====================================================================
 
         // ── Retry-on-failure mode: try Ollama first, escalate on refusal ──
         int estTokens = estimateRequestTokens(body);
@@ -285,6 +297,7 @@ void Server::handleChatCompletion(const httplib::Request& req, httplib::Response
                     entry.cost         = 0.0;
                     entry.streamed     = false;
                     entry.statusCode   = 200;
+                    entry.reason       = ollamaDec.reason;
                     m_cost.logRequest(entry);
                 }
 
@@ -328,6 +341,7 @@ void Server::handleChatCompletion(const httplib::Request& req, httplib::Response
             entry.cost         = result.cost;
             entry.streamed     = false;
             entry.statusCode   = 200;
+            entry.reason       = decision.reason;
             m_cost.logRequest(entry);
         }
 
@@ -335,243 +349,6 @@ void Server::handleChatCompletion(const httplib::Request& req, httplib::Response
         res.status = 200;
         res.set_content(result.response.dump(2), "application/json");
     }
-}
-
-// =============================================================================
-// Streaming chat  (POST /v1/chat/completions with stream=true)
-// =============================================================================
-void Server::handleStreamingChat(const json& body,
-                                  const RouteDecision& decision,
-                                  httplib::Response& res)
-{
-    auto state = std::make_shared<StreamState>();
-
-    // Generate a unique request id for SSE framing
-    auto now  = std::chrono::system_clock::now();
-    auto us   = std::chrono::duration_cast<std::chrono::microseconds>(
-                    now.time_since_epoch()).count();
-    auto id   = "chatcmpl-" + std::to_string(us);
-
-    // ── Retry-on-failure mode: collect Ollama stream, retry on refusal ──
-    int est = estimateRequestTokens(body);
-    if (m_config.router.retryOnFailure && decision.backend == "cloud"
-        && est <= m_config.router.retryMaxTokens) {
-        std::clog << "[Retry] (stream) est=" << est << " tok — trying Ollama first\n";
-        std::string buffer;
-        int chunkCount = 0;
-
-        RouteDecision ollamaDec;
-        ollamaDec.backend  = "ollama";
-        ollamaDec.model    = m_config.ollama.model;
-        ollamaDec.provider = "ollama";
-        ollamaDec.reason   = "retry_on_failure: try Ollama stream first";
-
-        std::clog << "[Retry] (stream) est=" << est << " tok — trying Ollama first\n";
-
-        // Set shorter timeout for Ollama retry
-        m_ollama.setReadTimeout(m_config.router.retryTimeoutMs / 1000);
-
-        RouteResult ollamaResult = m_router.routeStream(ollamaDec, body,
-            [&buffer, &chunkCount](const std::string& chunk) {
-                buffer += chunk;
-                chunkCount++;
-            });
-
-        // Restore normal timeout
-        m_ollama.setReadTimeout(120);
-
-        // Check if Ollama's response was a refusal
-        if (!ollamaResult.error && chunkCount > 0 &&
-            !isRefusalResponse(ollamaResult.response,
-                m_config.router.retryRefusalPatterns)) {
-            // Ollama succeeded — serve the buffered chunks as SSE
-            std::clog << "[Retry] (stream) Ollama succeeded — "
-                      << chunkCount << " chunks, $0\n";
-
-            json finalResp = ollamaResult.response;
-            auto model      = ollamaResult.model;
-
-            // Log usage
-            if (m_config.costTracking) {
-                UsageEntry entry;
-                entry.timestamp    = std::chrono::system_clock::now();
-                entry.model        = model;
-                entry.backend      = "ollama";
-                entry.provider     = ollamaResult.provider;
-                entry.inputTokens  = ollamaResult.inputTokens;
-                entry.outputTokens = ollamaResult.outputTokens;
-                entry.cacheTokens  = ollamaResult.cacheTokens;
-                entry.cost         = 0.0;
-                entry.streamed     = true;
-                entry.statusCode   = 200;
-                m_cost.logRequest(entry);
-            }
-
-            // Append final [DONE] marker
-            buffer += "data: [DONE]\n\n";
-
-            res.status = 200;
-            res.set_content(buffer, "text/event-stream");
-            return;
-        }
-
-        // Ollama refused — fall back to cloud non-streaming
-        std::clog << "[Retry] (stream) Ollama refused — escalating to "
-                  << m_config.cloud.model << "\n";
-
-        json cloudBody = body;
-        cloudBody["stream"] = false;
-
-        RouteDecision cloudDec;
-        cloudDec.backend  = "cloud";
-        cloudDec.model    = m_config.cloud.model;
-        cloudDec.provider = m_config.cloud.provider;
-        cloudDec.reason   = "retry_on_failure: ollama stream refused, retry cloud";
-
-        auto cloudResult = m_router.route(cloudDec, body);
-
-        if (cloudResult.error) {
-            json err = {{"error", {{"message", cloudResult.errorMessage},
-                                   {"type", "upstream_error"},
-                                   {"code", cloudResult.statusCode}}}};
-            res.status = cloudResult.statusCode > 0 ? cloudResult.statusCode : 502;
-            res.set_content(err.dump(2), "application/json");
-            return;
-        }
-
-        // Log cloud usage
-        if (m_config.costTracking) {
-            UsageEntry entry;
-            entry.timestamp    = std::chrono::system_clock::now();
-            entry.model        = cloudResult.model;
-            entry.backend      = "cloud";
-            entry.provider     = cloudResult.provider;
-            entry.inputTokens  = cloudResult.inputTokens;
-            entry.outputTokens = cloudResult.outputTokens;
-            entry.cacheTokens  = cloudResult.cacheTokens;
-            entry.cost         = cloudResult.cost;
-            entry.streamed     = true;
-            entry.statusCode   = 200;
-            m_cost.logRequest(entry);
-        }
-
-        // Serve the cloud response as a single SSE chunk + [DONE]
-        std::string model = cloudResult.model;
-        auto ts = std::chrono::duration_cast<std::chrono::microseconds>(
-                      std::chrono::system_clock::now().time_since_epoch()).count();
-        std::string sseId = "chatcmpl-" + std::to_string(ts);
-
-        std::string sseBuffer;
-        // Extract content from cloud response
-        std::string content = extractContent(cloudResult.response);
-
-        // Send as one SSE chunk (the whole response)
-        json chunk = {
-            {"choices", json::array({json{
-                {"delta", json{{"content", content}, {"role", "assistant"}}},
-                {"finish_reason", nullptr},
-                {"index", 0}
-            }})},
-            {"created", ts / 1000000},
-            {"id", sseId},
-            {"model", model},
-            {"object", "chat.completion.chunk"}
-        };
-        sseBuffer += "data: " + chunk.dump() + "\n\n";
-
-        // Send final empty chunk with finish_reason=stop
-        json finalChunk = {
-            {"choices", json::array({json{
-                {"delta", json::object()},
-                {"finish_reason", "stop"},
-                {"index", 0}
-            }})},
-            {"created", ts / 1000000},
-            {"id", sseId},
-            {"model", model},
-            {"object", "chat.completion.chunk"}
-        };
-        sseBuffer += "data: " + finalChunk.dump() + "\n\n";
-        sseBuffer += "data: [DONE]\n\n";
-
-        res.status = 200;
-        res.set_content(sseBuffer, "text/event-stream");
-        return;
-    }
-
-    // ── Normal streaming path (no retry, or Ollama already chosen) ──
-    auto model = decision.model;
-
-    // Background thread: drive the upstream streaming client
-    auto streamThread = std::make_shared<std::thread>(
-        [this, state, body, decision]() {
-            RouteResult result = m_router.routeStream(decision, body,
-                [state](const std::string& chunk) {
-                    std::lock_guard<std::mutex> lock(state->mutex);
-                    state->chunks.push(chunk);
-                    state->cv.notify_one();
-                });
-
-            // Log usage after stream completes
-            if (m_config.costTracking && !result.error) {
-                UsageEntry entry;
-                entry.timestamp    = std::chrono::system_clock::now();
-                entry.model        = result.model;
-                entry.backend      = decision.backend;
-                entry.provider     = result.provider;
-                entry.inputTokens  = result.inputTokens;
-                entry.outputTokens = result.outputTokens;
-                entry.cacheTokens  = result.cacheTokens;
-                entry.cost         = result.cost;
-                entry.streamed     = true;
-                entry.statusCode   = 200;
-                m_cost.logRequest(entry);
-            }
-
-            {
-                std::lock_guard<std::mutex> lock(state->mutex);
-                state->result = result;
-                state->done   = true;
-            }
-            state->cv.notify_one();
-        });
-
-    // Content provider: bridge push -> pull for httplib
-    res.set_chunked_content_provider(
-        "text/event-stream",
-        [state, id, model](size_t /*offset*/,
-                           httplib::DataSink& sink) -> bool
-        {
-            std::unique_lock<std::mutex> lock(state->mutex);
-
-            // If stream already finished with no pending chunks, stop
-            if (state->done && state->chunks.empty()) {
-                return false;
-            }
-
-            // Block until data arrives or stream finishes
-            state->cv.wait(lock, [state]() {
-                return !state->chunks.empty() || state->done;
-            });
-
-            // Drain all available chunks into the sink
-            while (!state->chunks.empty()) {
-                sink.os << state->chunks.front();
-                state->chunks.pop();
-            }
-
-            if (state->done) {
-                sink.done();
-                return false;
-            }
-
-            return true;
-        },
-        [streamThread](bool /*success*/) {
-            if (streamThread->joinable()) {
-                streamThread->join();
-            }
-        });
 }
 
 // =============================================================================
@@ -649,7 +426,13 @@ void Server::handleAdminSummary(const httplib::Request& /*req*/, httplib::Respon
         {"cache_tokens",    daily.totalCache},
         {"total_cost",      daily.totalCost},
         {"ollama_requests", daily.ollamaCount},
-        {"cloud_requests",  daily.cloudCount}
+        {"cloud_requests",  daily.cloudCount},
+        {"ollama_input_tokens",  daily.ollamaInput},
+        {"ollama_output_tokens", daily.ollamaOutput},
+        {"ollama_cache_tokens",  daily.ollamaCache},
+        {"cloud_input_tokens",   daily.cloudInput},
+        {"cloud_output_tokens",  daily.cloudOutput},
+        {"cloud_cache_tokens",   daily.cloudCache}
     };
 
     // Rolling history (last 7 days)
@@ -664,14 +447,23 @@ void Server::handleAdminSummary(const httplib::Request& /*req*/, httplib::Respon
     }
     summary["history"] = histArr;
 
-    // Budget info
-    double remaining = m_config.router.dailyBudgetUsd - daily.totalCost;
+    // Budget info (monthly, prorated by day)
+    double monthly         = m_config.router.monthlyBudgetUsd;
+    int today              = CostTracker::dayOfMonth();
+    int totalDays          = CostTracker::daysInMonth();
+    double allowancePerDay = monthly / totalDays;
+    double allowanceSoFar  = today * allowancePerDay;
+    double monthToDate     = m_cost.monthToDateCost();
+    double remaining       = allowanceSoFar - monthToDate;
     if (remaining < 0.0) remaining = 0.0;
     summary["budget"] = {
-        {"daily_budget",  m_config.router.dailyBudgetUsd},
-        {"today_cost",    daily.totalCost},
-        {"remaining",     remaining},
-        {"over_budget",   daily.totalCost >= m_config.router.dailyBudgetUsd}
+        {"monthly_budget",     monthly},
+        {"daily_allowance",    allowancePerDay},
+        {"month_to_date_cost", monthToDate},
+        {"day_of_month",       today},
+        {"days_in_month",      totalDays},
+        {"remaining",          remaining},
+        {"over_budget",        m_cost.isOverMonthlyBudget(monthly)}
     };
 
     res.set_content(summary.dump(2), "application/json");
@@ -695,8 +487,9 @@ void Server::handleAdminConfigPost(const httplib::Request& req,
     try {
         body = json::parse(req.body);
     } catch (const std::exception& e) {
-        json err = {{"error", {{"message", "Invalid JSON: " +
-                                            std::string(e.what())}}}};
+        json err = {{"error", {{"message", "Invalid JSON: " + std::string(e.what())},
+                               {"type", "invalid_request_error"},
+                               {"code", 400}}}};
         res.status = 400;
         res.set_content(err.dump(2), "application/json");
         return;
@@ -732,4 +525,265 @@ void Server::handleAdminConfigPost(const httplib::Request& req,
         res.status = 400;
         res.set_content(err.dump(2), "application/json");
     }
+}
+
+// =============================================================================
+// GET /admin/refresh-usage
+// =============================================================================
+void Server::handleAdminRefreshUsage(const httplib::Request& /*req*/,
+                                       httplib::Response& res) {
+    try {
+        m_cost.reload();
+        json resp = {
+            {"status",  "ok"},
+            {"message", "Usage data refreshed"}
+        };
+        res.set_content(resp.dump(2), "application/json");
+    } catch (const std::exception& e) {
+        json err = {{"error", {{"message", "Failed to refresh usage data: " +
+                                            std::string(e.what())}}}};
+        res.status = 500;
+        res.set_content(err.dump(2), "application/json");
+    }
+}
+
+
+// =============================================================================
+// Streaming chat  (POST /v1/chat/completions with stream=true)
+// =============================================================================
+void Server::handleStreamingChat(const json& body,
+                                  const RouteDecision& decision,
+                                  httplib::Response& res)
+{
+    auto state = std::make_shared<StreamState>();
+
+    // Generate a unique request id for SSE framing
+    auto now  = std::chrono::system_clock::now();
+    auto us   = std::chrono::duration_cast<std::chrono::microseconds>(
+                    now.time_since_epoch()).count();
+    auto id   = "chatcmpl-" + std::to_string(us);
+
+    // ── Retry-on-failure mode: collect Ollama stream, retry on refusal ──
+    int est = estimateRequestTokens(body);
+    if (m_config.router.retryOnFailure && decision.backend == "cloud"
+        && est <= m_config.router.retryMaxTokens) {
+        std::clog << "[Retry] (stream) est=" << est << " tok — trying Ollama first despite keyword escalation\n";
+        std::string buffer;
+        int chunkCount = 0;
+
+        RouteDecision ollamaDec;
+        ollamaDec.backend  = "ollama";
+        ollamaDec.model    = m_config.ollama.model;
+        ollamaDec.provider = "ollama";
+        ollamaDec.reason   = "retry_on_failure: try Ollama stream first";
+
+        std::clog << "[Retry] (stream) est=" << est << " tok — trying Ollama first\n";
+
+        // Set shorter timeout for Ollama retry
+        m_ollama.setReadTimeout(m_config.router.retryTimeoutMs / 1000);
+
+        RouteResult ollamaResult = m_router.routeStream(ollamaDec, body,
+            [&buffer, &chunkCount](const std::string& chunk) {
+                buffer += chunk;
+                chunkCount++;
+            });
+
+        // Restore normal timeout
+        m_ollama.setReadTimeout(120);
+
+        // Check if Ollama's response was a refusal
+        if (!ollamaResult.error && chunkCount > 0 &&
+            !isRefusalResponse(ollamaResult.response,
+                m_config.router.retryRefusalPatterns)) {
+            // Ollama succeeded — serve the buffered chunks as SSE
+            std::clog << "[Retry] (stream) Ollama succeeded — "
+                      << chunkCount << " chunks, $0\n";
+
+            json finalResp = ollamaResult.response;
+            auto model      = ollamaResult.model;
+
+            // Log usage
+            if (m_config.costTracking) {
+                UsageEntry entry;
+                entry.timestamp    = std::chrono::system_clock::now();
+                entry.model        = model;
+                entry.backend      = "ollama";
+                entry.provider     = ollamaResult.provider;
+                entry.inputTokens  = ollamaResult.inputTokens;
+                entry.outputTokens = ollamaResult.outputTokens;
+                entry.cacheTokens  = ollamaResult.cacheTokens;
+                entry.cost         = 0.0;
+                entry.streamed     = true;
+                entry.statusCode   = 200;
+                entry.reason       = ollamaDec.reason;
+                m_cost.logRequest(entry);
+            }
+
+            // Append final [DONE] marker
+            buffer += "data: [DONE]\n\n";
+
+            res.status = 200;
+            res.set_content(buffer, "text/event-stream");
+            return;
+        }
+
+        // Ollama refused — fall back to cloud non-streaming
+        std::clog << "[Retry] (stream) Ollama refused — escalating to "
+                  << m_config.cloud.model << "\n";
+
+        json cloudBody = body;
+        cloudBody["stream"] = false;
+
+        RouteDecision cloudDec;
+        cloudDec.backend  = "cloud";
+        cloudDec.model    = m_config.cloud.model;
+        cloudDec.provider = m_config.cloud.provider;
+        cloudDec.reason   = "retry_on_failure: ollama stream refused, retry cloud";
+
+        auto cloudResult = m_router.route(cloudDec, body);
+
+        if (cloudResult.error) {
+            json err = {{"error", {{"message", cloudResult.errorMessage},
+                                   {"type", "upstream_error"},
+                                   {"code", cloudResult.statusCode}}}};
+            res.status = cloudResult.statusCode > 0 ? cloudResult.statusCode : 502;
+            res.set_content(err.dump(2), "application/json");
+            return;
+        }
+
+        // Log cloud usage
+        if (m_config.costTracking) {
+            UsageEntry entry;
+            entry.timestamp    = std::chrono::system_clock::now();
+            entry.model        = cloudResult.model;
+            entry.backend      = "cloud";
+            entry.provider     = cloudResult.provider;
+            entry.inputTokens  = cloudResult.inputTokens;
+            entry.outputTokens = cloudResult.outputTokens;
+            entry.cacheTokens  = cloudResult.cacheTokens;
+            entry.cost         = cloudResult.cost;
+            entry.streamed     = true;
+            entry.statusCode   = 200;
+            entry.reason       = cloudDec.reason;
+            m_cost.logRequest(entry);
+        }
+
+        // Serve the cloud response as a single SSE chunk + [DONE]
+        std::string model = cloudResult.model;
+        auto ts = std::chrono::duration_cast<std::chrono::microseconds>(
+                      std::chrono::system_clock::now().time_since_epoch()).count();
+        std::string sseId = "chatcmpl-" + std::to_string(ts);
+
+        std::string sseBuffer;
+        // Extract content from cloud response
+        std::string content = extractContent(cloudResult.response);
+
+        // Send as one SSE chunk (the whole response)
+        json chunk = {
+            {"choices", json::array({json{
+                {"delta", json{{"content", content}, {"role", "assistant"}}},
+                {"finish_reason", nullptr},
+                {"index", 0}
+            }})},
+            {"created", ts / 1000000},
+            {"id", sseId},
+            {"model", model},
+            {"object", "chat.completion.chunk"}
+        };
+        sseBuffer += "data: " + chunk.dump() + "\n\n";
+
+        // Send final empty chunk with finish_reason=stop
+        json finalChunk = {
+            {"choices", json::array({json{
+                {"delta", json::object()},
+                {"finish_reason", "stop"},
+                {"index", 0}
+            }})},
+            {"created", ts / 1000000},
+            {"id", sseId},
+            {"model", model},
+            {"object", "chat.completion.chunk"}
+        };
+        sseBuffer += "data: " + finalChunk.dump() + "\n\n";
+        sseBuffer += "data: [DONE]\n\n";
+
+        res.status = 200;
+        res.set_content(sseBuffer, "text/event-stream");
+        return;
+    }
+
+    // ── Normal streaming path (no retry, or Ollama already chosen) ──
+    auto model = decision.model;
+
+    // Background thread: drive the upstream streaming client
+    auto streamThread = std::make_shared<std::thread>(
+        [this, state, body, decision]() {
+            RouteResult result = m_router.routeStream(decision, body,
+                [state](const std::string& chunk) {
+                    std::lock_guard<std::mutex> lock(state->mutex);
+                    state->chunks.push(chunk);
+                    state->cv.notify_one();
+                });
+
+            // Log usage after stream completes
+            if (m_config.costTracking && !result.error) {
+                UsageEntry entry;
+                entry.timestamp    = std::chrono::system_clock::now();
+                entry.model        = result.model;
+                entry.backend      = decision.backend;
+                entry.provider     = result.provider;
+                entry.inputTokens  = result.inputTokens;
+                entry.outputTokens = result.outputTokens;
+                entry.cacheTokens  = result.cacheTokens;
+                entry.cost         = result.cost;
+                entry.streamed     = true;
+                entry.statusCode   = 200;
+                entry.reason       = decision.reason;
+                m_cost.logRequest(entry);
+            }
+
+            {
+                std::lock_guard<std::mutex> lock(state->mutex);
+                state->result = result;
+                state->done   = true;
+            }
+            state->cv.notify_one();
+        });
+
+    // Content provider: bridge push -> pull for httplib
+    res.set_chunked_content_provider(
+        "text/event-stream",
+        [state, id, model](size_t /*offset*/,
+                           httplib::DataSink& sink) -> bool
+        {
+            std::unique_lock<std::mutex> lock(state->mutex);
+
+            // If stream already finished with no pending chunks, stop
+            if (state->done && state->chunks.empty()) {
+                return false;
+            }
+
+            // Block until data arrives or stream finishes
+            state->cv.wait(lock, [state]() {
+                return !state->chunks.empty() || state->done;
+            });
+
+            // Drain all available chunks into the sink
+            while (!state->chunks.empty()) {
+                sink.os << state->chunks.front();
+                state->chunks.pop();
+            }
+
+            if (state->done) {
+                sink.done();
+                return false;
+            }
+
+            return true;
+        },
+        [streamThread](bool /*success*/) {
+            if (streamThread->joinable()) {
+                streamThread->join();
+            }
+        });
 }

@@ -2,6 +2,13 @@
 #include <iostream>
 #include <sstream>
 
+// RAII helper to decrement active requests counter
+struct ActiveRequestGuard {
+    std::atomic<int>& counter;
+    ActiveRequestGuard(std::atomic<int>& c) : counter(c) { counter++; }
+    ~ActiveRequestGuard() { counter--; }
+};
+
 OllamaClient::OllamaClient(const std::string& baseUrl)
     : m_baseUrl(baseUrl), m_http(baseUrl) {
     m_http.set_connection_timeout(30);
@@ -111,6 +118,7 @@ std::string OllamaClient::ollamaChunkToSSE(const nlohmann::json& chunk,
 }
 
 nlohmann::json OllamaClient::chatCompletion(const nlohmann::json& request) {
+    ActiveRequestGuard guard(m_activeRequests); // Increment on entry, decrement on exit
     auto ollamaReq = openAItoOllama(request);
     ollamaReq["stream"] = false;
 
@@ -138,6 +146,8 @@ nlohmann::json OllamaClient::chatCompletion(const nlohmann::json& request) {
 nlohmann::json OllamaClient::chatCompletionStream(
     const nlohmann::json& request,
     std::function<void(const std::string& chunk)> onChunk) {
+
+    ActiveRequestGuard guard(m_activeRequests); // Increment on entry, decrement on exit
 
     auto ollamaReq = openAItoOllama(request);
     ollamaReq["stream"] = true;

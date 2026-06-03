@@ -38,9 +38,12 @@ public:
     // Override read timeout for retry-mode calls (shorter timeout)
     void setReadTimeout(int seconds);
 
+    int getActiveRequests() const { return m_activeRequests.load(); }
+
 private:
     std::string m_baseUrl;
     httplib::Client m_http;
+    std::atomic<int> m_activeRequests{0};
 };
 
 #endif // LLM_COST_ROUTER_OLLAMA_H

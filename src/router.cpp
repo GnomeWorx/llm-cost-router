@@ -33,15 +33,20 @@ static int estimateTokenCount(const nlohmann::json& request) {
     return chars / 4 + 1;  // floor division + 1 to avoid zero
 }
 
-// Case-insensitive substring search in all message content
+// Case-insensitive substring search in user/assistant message content only
+// (system prompt always contains skill names like "architecture", "design" — not user intent)
 static bool hasEscalateKeywords(const nlohmann::json& request,
                                  const std::vector<std::string>& keywords) {
     if (keywords.empty()) return false;
 
-    // Collect all text from messages
+    // Collect all text from user and assistant messages only
     std::string allText;
     if (request.contains("messages") && request["messages"].is_array()) {
         for (const auto& msg : request["messages"]) {
+            if (msg.contains("role") && msg["role"].is_string()) {
+                std::string role = msg["role"];
+                if (role != "user" && role != "assistant") continue;
+            }
             if (msg.contains("content") && msg["content"].is_string()) {
                 allText += msg["content"].get<std::string>() + " ";
             }
@@ -92,6 +97,13 @@ RouteDecision Router::decide(const nlohmann::json& request) {
             d.reason = "model matches ollama backend: " + reqModel;
             goto resolve_model;
         }
+    }
+
+    // 0.5. Ollama busy fallback
+    if (rc.ollamaFallbackOnBusy && m_ollama.getActiveRequests() > 0) {
+        d.backend = "cloud";
+        d.reason = "ollama busy, falling back to cloud";
+        goto resolve_model;
     }
 
     // 1. Force override from header (stored in _meta.force_backend)

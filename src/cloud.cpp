@@ -1,5 +1,6 @@
 #include "cloud.h"
 #include <iostream>
+#include <sstream>
 
 CloudClient::CloudClient(const std::string& baseUrl,
                           const std::string& apiKey,
@@ -64,24 +65,34 @@ nlohmann::json CloudClient::chatCompletionStream(
             std::string chunk(data, data_length);
             onChunk(chunk);
 
-            // Parse SSE for usage tracking
-            if (chunk.find("data: ") == 0) {
-                std::string jsonStr = chunk.substr(6);
-                if (jsonStr.find("[DONE]") == std::string::npos) {
-                    try {
-                        auto j = nlohmann::json::parse(jsonStr);
+            // Split by SSE event boundaries (\n\n) to handle
+            // multiple events in one TCP chunk (e.g. usage + [DONE])
+            std::istringstream stream(chunk);
+            std::string sseLine;
+            while (std::getline(stream, sseLine)) {
+                // Trim trailing \r
+                if (!sseLine.empty() && sseLine.back() == '\r')
+                    sseLine.pop_back();
+
+                if (sseLine.find("data: ") != 0) continue;
+                std::string payload = sseLine.substr(6);
+                if (payload == "[DONE]") continue;
+
+                try {
+                    auto j = nlohmann::json::parse(payload);
+                    if (j.contains("choices") && j["choices"].is_array() && !j["choices"].empty()) {
                         auto& delta = j["choices"][0]["delta"];
                         if (delta.contains("content") && delta["content"].is_string()) {
                             usage["content"] = usage["content"].get<std::string>() + delta["content"].get<std::string>();
                         }
-                        if (j.contains("usage")) {
-                            auto& u = j["usage"];
-                            usage["prompt_tokens"] = u.value("prompt_tokens", 0);
-                            usage["completion_tokens"] = u.value("completion_tokens", 0);
-                            usage["cache_tokens"] = u.value("prompt_cache_hit_tokens", 0);
-                        }
-                    } catch (...) {}
-                }
+                    }
+                    if (j.contains("usage")) {
+                        auto& u = j["usage"];
+                        usage["prompt_tokens"] = u.value("prompt_tokens", 0);
+                        usage["completion_tokens"] = u.value("completion_tokens", 0);
+                        usage["cache_tokens"] = u.value("prompt_cache_hit_tokens", 0);
+                    }
+                } catch (...) {}
             }
             return true;
         });

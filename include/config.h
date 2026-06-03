@@ -10,13 +10,15 @@ struct RouterConfig {
     int         tokenThreshold  = 1200;       // prompts under this → defaultBackend
     bool        keywordEscalation = true;     // trigger keywords force cloud
     bool        llmJudgeEnabled = false;      // Phase 3
-    double      dailyBudgetUsd = 15.0;        // hard cap
+    double      monthlyBudgetUsd = 20.0;        // monthly cap, prorated by day
 
     std::vector<std::string> escalateKeywords = {
-        "architecture", "design", "refactor", "plan", "deploy",
-        "security", "optimize", "complex", "analyse", "investigate",
-        "strategy", "migration", "deadlock", "race condition"
+        "architecture", "design", "refactor", "plan",
+        "deadlock", "race condition"
     };
+
+    // Fallback to cloud if Ollama is busy
+    bool ollamaFallbackOnBusy = false;
 
     // Retry on failure mode — try Ollama first, only fall back to cloud if it refuses
     bool retryOnFailure = false;
@@ -65,8 +67,9 @@ inline void to_json(nlohmann::json& j, const RouterConfig& r) {
         {"token_threshold", r.tokenThreshold},
         {"keyword_escalation", r.keywordEscalation},
         {"llm_judge_enabled", r.llmJudgeEnabled},
-        {"daily_budget_usd", r.dailyBudgetUsd},
+        {"monthly_budget_usd", r.monthlyBudgetUsd},
         {"escalate_keywords", r.escalateKeywords},
+        {"ollama_fallback_on_busy", r.ollamaFallbackOnBusy},
         {"retry_on_failure", r.retryOnFailure},
         {"retry_max_tokens", r.retryMaxTokens},
         {"retry_timeout_ms", r.retryTimeoutMs},
@@ -79,8 +82,10 @@ inline void from_json(const nlohmann::json& j, RouterConfig& r) {
     r.tokenThreshold       = j.value("token_threshold", r.tokenThreshold);
     r.keywordEscalation    = j.value("keyword_escalation", r.keywordEscalation);
     r.llmJudgeEnabled      = j.value("llm_judge_enabled", r.llmJudgeEnabled);
-    r.dailyBudgetUsd       = j.value("daily_budget_usd", r.dailyBudgetUsd);
+    r.monthlyBudgetUsd     = j.value("monthly_budget_usd",
+                               j.value("daily_budget_usd", r.monthlyBudgetUsd)); // Allow daily_budget_usd for backward compat
     r.escalateKeywords     = j.value("escalate_keywords", r.escalateKeywords);
+    r.ollamaFallbackOnBusy = j.value("ollama_fallback_on_busy", r.ollamaFallbackOnBusy);
     r.retryOnFailure       = j.value("retry_on_failure", r.retryOnFailure);
     r.retryMaxTokens       = j.value("retry_max_tokens", r.retryMaxTokens);
     r.retryTimeoutMs       = j.value("retry_timeout_ms", r.retryTimeoutMs);

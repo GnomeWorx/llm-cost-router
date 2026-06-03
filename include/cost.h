@@ -18,6 +18,7 @@ struct UsageEntry {
     int64_t     durationMs   = 0;
     bool        streamed     = false;
     int         statusCode   = 200;
+    std::string reason;         // routing decision reason
 };
 
 struct DailySummary {
@@ -29,6 +30,12 @@ struct DailySummary {
     double      totalCost       = 0.0;
     int         ollamaCount     = 0;
     int         cloudCount      = 0;
+    int64_t     ollamaInput     = 0;
+    int64_t     ollamaOutput    = 0;
+    int64_t     ollamaCache     = 0;
+    int64_t     cloudInput      = 0;
+    int64_t     cloudOutput     = 0;
+    int64_t     cloudCache      = 0;
 };
 
 class CostTracker {
@@ -53,12 +60,19 @@ public:
     // Reload log file
     void reload();
 
+    // Monthly budget helpers
+    static int dayOfMonth();
+    static int daysInMonth();
+    double monthToDateCost();
+    bool isOverMonthlyBudget(double monthlyBudget);
+
 private:
     std::string m_logPath;
     std::vector<UsageEntry> m_entries;
 
     void ensureLogDir();
     std::string todayStr() const;
+    std::string getAdjustedDateString(std::chrono::system_clock::time_point timestamp) const;
     UsageEntry parseLine(const std::string& line) const;
 };
 
