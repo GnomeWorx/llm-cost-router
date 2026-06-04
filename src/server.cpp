@@ -640,7 +640,7 @@ void Server::handleStreamingChat(const json& body,
         cloudDec.provider = m_config.cloud.provider;
         cloudDec.reason   = "retry_on_failure: ollama stream refused, retry cloud";
 
-        auto cloudResult = m_router.route(cloudDec, body);
+        auto cloudResult = m_router.route(cloudDec, cloudBody);
 
         if (cloudResult.error) {
             json err = {{"error", {{"message", cloudResult.errorMessage},

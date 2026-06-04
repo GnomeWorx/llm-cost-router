@@ -7,8 +7,8 @@ CloudClient::CloudClient(const std::string& baseUrl,
                           const std::string& defaultModel)
     : m_baseUrl(baseUrl), m_apiKey(apiKey), m_defaultModel(defaultModel),
       m_http(baseUrl) {
-    m_http.set_connection_timeout(5);
-    m_http.set_read_timeout(5);
+    m_http.set_connection_timeout(30);
+    m_http.set_read_timeout(120);
 }
 
 nlohmann::json CloudClient::chatCompletion(const nlohmann::json& request) {
@@ -22,7 +22,7 @@ nlohmann::json CloudClient::chatCompletion(const nlohmann::json& request) {
 
     if (!res || res->status != 200) {
         int status = res ? res->status : 0;
-        std::string errMsg = "Cloud API error";
+        std::string errMsg = "Cloud API error (HTTP " + std::to_string(status) + ")";
         if (res) {
             try {
                 auto errJson = nlohmann::json::parse(res->body);
@@ -37,7 +37,13 @@ nlohmann::json CloudClient::chatCompletion(const nlohmann::json& request) {
     try {
         return nlohmann::json::parse(res->body);
     } catch (const std::exception& e) {
-        return {{"error", true}, {"message", std::string("Parse error: ") + e.what()}, {"status", 502}};
+        // Include raw body snippet for diagnosing non-JSON responses
+        std::string rawPreview = res->body.substr(0, 200);
+        // sanitize: replace newline chars with space
+        for (auto& c : rawPreview) { if (c == '\x0a') c = ' '; }
+        return {{"error", true},
+                {"message", std::string("Parse error: ") + e.what() + " | body: " + rawPreview},
+                {"status", 502}};
     }
 }
 
@@ -65,13 +71,13 @@ nlohmann::json CloudClient::chatCompletionStream(
             std::string chunk(data, data_length);
             onChunk(chunk);
 
-            // Split by SSE event boundaries (\n\n) to handle
+            // Split by SSE event boundaries (\x0a\x0a) to handle
             // multiple events in one TCP chunk (e.g. usage + [DONE])
             std::istringstream stream(chunk);
             std::string sseLine;
             while (std::getline(stream, sseLine)) {
-                // Trim trailing \r
-                if (!sseLine.empty() && sseLine.back() == '\r')
+                // Trim trailing \x0d
+                if (!sseLine.empty() && sseLine.back() == '\x0d')
                     sseLine.pop_back();
 
                 if (sseLine.find("data: ") != 0) continue;
